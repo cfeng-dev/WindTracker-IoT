@@ -40,8 +40,8 @@ WindTracker-IoT is an intelligent, real-time, and internet-enabled project desig
 - Broker: "test.mosquitto.org"
 - Port: 1883
 - Topics: 
-  - "Sensor/Winddata" for wind data
-  - "Sensor/Error" for error messages
+  - "Sensor_KN/Winddata" for wind data
+  - "Sensor_KN/Error" for error messages
 
 ## Author
 
