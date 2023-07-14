@@ -9,6 +9,10 @@
   the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, 
   and SD library and RTCZero library to save the data with timestamp on the SD card.
 
+  The implementation has been enhanced with the use of the FreeRTOS_SAMD21 library, enabling multitasking capabilities
+  to improve the overall performance and reliability of the program. Tasks in the program include reading from the sensor,
+  handling data, and monitoring tasks, each running independently on separate cores.
+
   Circuit:
   - MKR NB 1500
   - Ecowitt WS90 Wind Sensor
@@ -34,6 +38,7 @@
 #include <MKRNB.h>
 #include <SD.h>
 #include <RTCZero.h>
+#include <FreeRTOS_SAMD21.h>
 
 // Set time (24-hour format)
 #define HOURS 18
@@ -60,6 +65,159 @@ const uint16_t port = 1883;
 const uint8_t QoS = 2;
 const char topic_windData[] = "Sensor_KN/Winddata";
 const char topic_errorMessage[] = "Sensor_KN/Error";
+
+// Define a structure to hold wind data
+struct WindData {
+  uint16_t windSpeedRaw;
+  uint16_t windDirection;
+  float windSpeed;
+};
+QueueHandle_t queueWindDataMqtt; // Handle to the queue storing data destined for MQTT communication
+QueueHandle_t queueWindDataMonitor; // Handle to the queue storing data destined for system monitoring
+
+//*****************************************************************************
+//
+// Function to handle sensor data collection and distribution.
+//
+//*****************************************************************************
+static void vTaskSensor(void *pvParameters) {
+  while(1) {
+    WindData data;
+    // Read wind speed register and wind direction register
+    data.windSpeedRaw = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_SPEED_REGISTER);
+    data.windDirection = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_DIRECTION_REGISTER);
+    data.windSpeed = data.windSpeedRaw * 0.1; // Convert raw wind speed to actual wind speed
+
+    // Send data to the queues, block for max. 100 ms if the queue is full
+    if (xQueueSend(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) != pdPASS ||
+      xQueueSend(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) != pdPASS) {
+      // handle error...
+      Serial.println("sensorTask Failed! \n");
+    }
+    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+  }
+}
+
+//*****************************************************************************
+//
+// Function to handle the processing of wind data:
+//
+// 1. If connected to the MQTT broker, validates the wind data and sends the formatted data to the broker.
+// 2. If not connected to the MQTT broker, saves wind data to SD card.
+// 3. If data exists on the SD card (i.e., when MQTT connection was previously unavailable), sends this data to the MQTT broker.
+//
+//*****************************************************************************
+static void vTaskDataHandler(void *pvParameters) {
+  while(1) {
+    // Current time
+    byte hours = rtc.getHours();
+    byte minutes = rtc.getMinutes();
+    byte seconds = rtc.getSeconds();
+    String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
+    WindData data;
+
+    if (xQueueReceive(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) == pdPASS) {
+      if (mqttClient.connected()) {
+        // Connection to MQTT broker
+        if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
+          // Both wind speed and wind direction have the battery-empty value, publish an error message
+          Serial.println("Error: Battery is empty.");
+          mqttClient.beginMessage(topic_errorMessage);
+          mqttClient.print("Error: Battery is empty.");
+          mqttClient.endMessage();
+        } else if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
+          String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
+
+          // Publish wind data via MQTT
+          mqttClient.beginMessage(topic_windData, false, QoS, false);
+          mqttClient.print(dataString);
+          mqttClient.endMessage();
+
+          // Read and send data from SD Card
+          if (SD.exists("winddata.txt")) {
+            File dataFile = SD.open("winddata.txt");
+            if (dataFile) {
+              String dataString;
+              while (dataFile.available()) {
+                dataString = dataFile.readStringUntil('\n');
+                mqttClient.beginMessage(topic_windData, false, QoS, false);
+                mqttClient.print(dataString);
+                mqttClient.endMessage();
+              }
+              dataFile.close();
+              SD.remove("winddata.txt");
+            } else {
+              Serial.println("Error opening winddata.txt");
+            }
+          } 
+        } else {
+          Serial.println(ModbusRTUClient.lastError());
+          // Publish error message via MQTT
+          mqttClient.beginMessage(topic_errorMessage);
+          mqttClient.print("Error: Time Out.");
+          mqttClient.endMessage();
+        }
+      } else {
+        // Not connected to the MQTT broker, saves wind data to SD card
+        if (data.windSpeedRaw != BATTERY_EMPTY_VALUE && data.windDirection != BATTERY_EMPTY_VALUE) {
+          if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
+            data.windSpeed = data.windSpeedRaw * 0.1;
+            String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
+            File dataFile = SD.open("winddata.txt", FILE_WRITE);
+            if (dataFile) {
+              dataFile.println(dataString);
+              Serial.print(dataString);
+              Serial.println(" ...saved");
+              dataFile.close();
+            } else {
+              Serial.println("Error opening winddata.txt");
+            }
+          } else {
+            Serial.println(ModbusRTUClient.lastError());
+          }
+        } else {
+        Serial.println("Error: Battery is empty.");
+        }  
+      }
+    
+    } else {
+      // handle error...
+      Serial.println("mqttTask Failed!");
+    }
+    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+  }  
+}
+
+//*****************************************************************************
+//
+// Function to monitor wind data.
+//
+//*****************************************************************************
+static void vTaskMonitor(void *pvParameters) {
+  while(1) {
+    WindData data;
+    if (xQueueReceive(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) == pdPASS) {
+      if (mqttClient.connected()) {
+        if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
+          // Both wind speed and wind direction have the battery-empty value, publish an error message
+          Serial.println("Error: Battery is empty.");
+        } else if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
+          // Monitor data
+          Serial.print("Wind Speed: ");
+          Serial.println(data.windSpeed, 1);
+          Serial.print("Wind Direction: ");
+          Serial.println(data.windDirection);
+        } else {
+          Serial.println(ModbusRTUClient.lastError());
+        }
+      }
+    } else {
+      // handle error...
+      Serial.println("monitorTask Failed!");
+    }  
+    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+  }
+}
 
 void setup() {
   Serial.begin(9600);
@@ -99,106 +257,35 @@ void setup() {
   rtc.setHours(HOURS);
   rtc.setMinutes(MINUTES);
   rtc.setSeconds(SECONDS);
+
+  // Create the queues
+  queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));  
+  queueWindDataMonitor = xQueueCreate(10, sizeof(WindData));
+  
+  // Check if the queues were created successfully
+  if (queueWindDataMqtt == NULL || queueWindDataMonitor == NULL) {
+    Serial.println("Error: Failed to create one or more queues.");
+
+    // Stop execution
+    while(1) {}
+  }
+
+  // Create tasks
+  xTaskCreate(vTaskSensor, "Sensor data collection",                  256, NULL, tskIDLE_PRIORITY + 2, NULL);
+  xTaskCreate(vTaskDataHandler, "Data processing and transmission",   512, NULL, tskIDLE_PRIORITY + 3, NULL);
+  xTaskCreate(vTaskMonitor, "System monitoring",                      128, NULL, tskIDLE_PRIORITY + 1, NULL);
+
+  // Start the FreeRTOS scheduler
+  vTaskStartScheduler();
+
+  // Should never get here
+  while (1) {
+	  Serial.println("Scheduler Failed!");
+	  Serial.flush();
+	  delay(1000);
+  }
 }
 
 void loop() {
-  // Current time
-  byte hours = rtc.getHours();
-  byte minutes = rtc.getMinutes();
-  byte seconds = rtc.getSeconds();
-  String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
-
-  // Print the current time
-  Serial.print(hours);
-  Serial.print(":");
-  Serial.print(minutes);
-  Serial.print(":");
-  Serial.println(seconds);
-
-  if (mqttClient.connected()) {
-    mqttPublish(timestamp);
-    readAndSendDataFromSDCard();
-  } else {
-    saveDataToSDCard(timestamp);
-  }
-  delay(5000); // 5 seconds
-}
-
-void mqttPublish(String timestamp) {
-  // Read wind speed register and wind direction register
-  uint16_t windSpeedRaw = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_SPEED_REGISTER);
-  uint16_t windDirection = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_DIRECTION_REGISTER);
-  float windSpeed;
-
-  if (windSpeedRaw == BATTERY_EMPTY_VALUE || windDirection == BATTERY_EMPTY_VALUE) {
-    // Both wind speed and wind direction have the battery-empty value, publish an error message
-    Serial.println("Error: Battery is empty.");
-    mqttClient.beginMessage(topic_errorMessage);
-    mqttClient.print("Error: Battery is empty.");
-    mqttClient.endMessage();
-  } else if (windSpeedRaw != TIME_OUT && windDirection != TIME_OUT) {
-    windSpeed = windSpeedRaw * 0.1; // Convert raw wind speed to actual wind speed
-    Serial.print("Wind Speed: ");
-    Serial.println(windSpeed, 1);
-    Serial.print("Wind Direction: ");
-    Serial.println(windDirection);
-    String dataString = timestamp + "," + String(windSpeed, 1) + "," + String(windDirection); // format in string
-
-    // Publish wind data via MQTT
-    mqttClient.beginMessage(topic_windData, false, QoS, false);
-    mqttClient.print(dataString);
-    mqttClient.endMessage();
-  } else {
-    Serial.println(ModbusRTUClient.lastError());
-    // Publish error message via MQTT
-    mqttClient.beginMessage(topic_errorMessage);
-    mqttClient.print("Error: Time Out.");
-    mqttClient.endMessage();
-  }
-}
-
-void saveDataToSDCard(String timestamp) {
-  // Read wind speed register and wind direction register
-  uint16_t windSpeedRaw = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_SPEED_REGISTER);
-  uint16_t windDirection = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_DIRECTION_REGISTER);
-  float windSpeed;
-
-  if (windSpeedRaw != BATTERY_EMPTY_VALUE && windDirection != BATTERY_EMPTY_VALUE) {
-    if (windSpeedRaw != TIME_OUT && windDirection != TIME_OUT) {
-      windSpeed = windSpeedRaw * 0.1;
-      String dataString = timestamp + "," + String(windSpeed, 1) + "," + String(windDirection); // format in string
-      File dataFile = SD.open("winddata.txt", FILE_WRITE);
-      if (dataFile) {
-        dataFile.println(dataString);
-        Serial.print(dataString);
-        Serial.println(" ...saved");
-        dataFile.close();
-      } else {
-        Serial.println("Error opening winddata.txt");
-      }
-    } else {
-      Serial.println(ModbusRTUClient.lastError());
-    }
-  } else {
-    Serial.println("Error: Battery is empty.");
-  }
-}
-
-void readAndSendDataFromSDCard() {
-  if (SD.exists("winddata.txt")) {
-    File dataFile = SD.open("winddata.txt");
-    if (dataFile) {
-      String dataString;
-      while (dataFile.available()) {
-        dataString = dataFile.readStringUntil('\n');
-        mqttClient.beginMessage(topic_windData, false, QoS, false);
-        mqttClient.print(dataString);
-        mqttClient.endMessage();
-      }
-      dataFile.close();
-      SD.remove("winddata.txt");
-    } else {
-      Serial.println("Error opening winddata.txt");
-    }
-  } 
+  // If execution reaches here, then there might be insufficient heap memory for creating the idle task
 }
