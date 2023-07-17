@@ -89,10 +89,19 @@ static void vTaskSensor(void *pvParameters) {
     data.windSpeed = data.windSpeedRaw * 0.1; // Convert raw wind speed to actual wind speed
 
     // Send data to the queues, block for max. 100 ms if the queue is full
-    if (xQueueSend(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) != pdPASS ||
-      xQueueSend(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) != pdPASS) {
+    if (xQueueSend(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) != pdPASS) {
       // handle error...
-      Serial.println("sensorTask Failed! \n");
+      Serial.println("Failed to send data to MQTT queue!");
+      // Retry sending data to the queue
+      vTaskDelay(pdMS_TO_TICKS(200));  // delay for 200 ms before retry
+      xQueueSend(queueWindDataMqtt, &data, portMAX_DELAY);  // try sending again with indefinite blocking
+    }
+    if (xQueueSend(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) != pdPASS) {
+      // handle error...
+      Serial.println("Failed to send data to Monitor queue!");
+      // Retry sending data to the queue
+      vTaskDelay(pdMS_TO_TICKS(200));  // delay for 200 ms before retry
+      xQueueSend(queueWindDataMonitor, &data, portMAX_DELAY);  // try sending again with indefinite blocking
     }
     vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
   }
@@ -121,7 +130,6 @@ static void vTaskDataHandler(void *pvParameters) {
         // Connection to MQTT broker
         if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
           // Both wind speed and wind direction have the battery-empty value, publish an error message
-          Serial.println("Error: Battery is empty.");
           mqttClient.beginMessage(topic_errorMessage);
           mqttClient.print("Error: Battery is empty.");
           mqttClient.endMessage();
@@ -182,7 +190,9 @@ static void vTaskDataHandler(void *pvParameters) {
     
     } else {
       // handle error...
-      Serial.println("mqttTask Failed!");
+      Serial.println("Failed to receive data from the MQTT queue!");
+      // clear the queue
+      xQueueReset(queueWindDataMqtt);
     }
     vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
   }  
@@ -199,7 +209,7 @@ static void vTaskMonitor(void *pvParameters) {
     if (xQueueReceive(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) == pdPASS) {
       if (mqttClient.connected()) {
         if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
-          // Both wind speed and wind direction have the battery-empty value, publish an error message
+          // Error message is displayed in the monitor when both wind speed and wind direction have the battery-empty value
           Serial.println("Error: Battery is empty.");
         } else if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
           // Monitor data
@@ -210,10 +220,14 @@ static void vTaskMonitor(void *pvParameters) {
         } else {
           Serial.println(ModbusRTUClient.lastError());
         }
+      } else {
+        Serial.print("Failed to connect to MQTT broker!");
       }
     } else {
       // handle error...
-      Serial.println("monitorTask Failed!");
+      Serial.println("Failed to receive data from the monitor queue!");
+      // clear the queue
+      xQueueReset(queueWindDataMonitor);
     }  
     vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
   }
@@ -236,12 +250,12 @@ void setup() {
   }
 
   // Initialize SD card
-  Serial.print("Initializing SD card...");
+  Serial.print("Initializing SD card... ");
   if (!SD.begin()) {
     Serial.println("SD card failed, or not present");
     while (1);
   } else {
-    Serial.println(" SD card initialized.");
+    Serial.println("SD card initialized.");
   }
 
   // Connect to MQTT
@@ -267,7 +281,7 @@ void setup() {
     Serial.println("Error: Failed to create one or more queues.");
 
     // Stop execution
-    while(1) {}
+    while (1);
   }
 
   // Create tasks
