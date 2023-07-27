@@ -6,12 +6,15 @@
   Once the internet is back, the stored data is then published again via the broker.
   
   The program uses the ArduinoModbus library and ArduinoRS485 library to communicate with the wind sensor,
-  the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, 
-  and SD library and RTCZero library to save the data with timestamp on the SD card.
+  the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, and SD library and RTCZero library 
+  to save the data with timestamp on the SD card, and the wdt_samd21 library to enable and manage the Watchdog Timer functionality.
 
   The implementation has been enhanced with the use of the FreeRTOS_SAMD21 library, enabling multitasking capabilities
   to improve the overall performance and reliability of the program. Tasks in the program include reading from the sensor,
   handling data, and monitoring tasks, each running independently on separate cores.
+
+  The watchdog task, implemented using the wdt_samd21 library, continuously monitors the execution of the other tasks.
+  If there are no signals within a specified period of time, it initiates a system reset to prevent failures.
 
   Circuit:
   - MKR NB 1500
@@ -39,6 +42,7 @@
 #include <SD.h>
 #include <RTCZero.h>
 #include <FreeRTOS_SAMD21.h>
+#include <wdt_samd21.h>
 
 // Set time (24-hour format)
 #define HOURS 18
@@ -72,8 +76,16 @@ struct WindData {
   uint16_t windDirection;
   float windSpeed;
 };
+
+// Define a structure to hold wind heartbeat
+struct Heartbeat {
+  bool sensor;
+  bool dataHandler;
+};
+
 QueueHandle_t queueWindDataMqtt; // Handle to the queue storing data destined for MQTT communication
-QueueHandle_t queueWindDataMonitor; // Handle to the queue storing data destined for system monitoring
+QueueHandle_t queueHeartbeatSensor; // Handle to the queue storing data destined for system monitoring
+QueueHandle_t queueHeartbeatDataHandler;
 
 //*****************************************************************************
 //
@@ -83,10 +95,13 @@ QueueHandle_t queueWindDataMonitor; // Handle to the queue storing data destined
 static void vTaskSensor(void *pvParameters) {
   while(1) {
     WindData data;
+    Heartbeat sensorHeartbeat;
     // Read wind speed register and wind direction register
     data.windSpeedRaw = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_SPEED_REGISTER);
     data.windDirection = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_DIRECTION_REGISTER);
     data.windSpeed = data.windSpeedRaw * 0.1; // Convert raw wind speed to actual wind speed
+    sensorHeartbeat.sensor = true;
+    sensorHeartbeat.dataHandler = false;
 
     // Send data to the queues, block for max. 100 ms if the queue is full
     if (xQueueSend(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) != pdPASS) {
@@ -96,12 +111,9 @@ static void vTaskSensor(void *pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(200));  // delay for 200 ms before retry
       xQueueSend(queueWindDataMqtt, &data, portMAX_DELAY);  // try sending again with indefinite blocking
     }
-    if (xQueueSend(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) != pdPASS) {
+    if (xQueueSend(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(100)) != pdPASS) {
       // handle error...
-      Serial.println("Failed to send data to Monitor queue!");
-      // Retry sending data to the queue
-      vTaskDelay(pdMS_TO_TICKS(200));  // delay for 200 ms before retry
-      xQueueSend(queueWindDataMonitor, &data, portMAX_DELAY);  // try sending again with indefinite blocking
+      Serial.println("Failed to send heartbeat from Sensor task!");
     }
     vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
   }
@@ -124,17 +136,27 @@ static void vTaskDataHandler(void *pvParameters) {
     byte seconds = rtc.getSeconds();
     String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
     WindData data;
+    Heartbeat dataHandlerHeartbeat;
 
     if (xQueueReceive(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) == pdPASS) {
+      dataHandlerHeartbeat.sensor = false;
+      dataHandlerHeartbeat.dataHandler = true;
       if (mqttClient.connected()) {
         // Connection to MQTT broker
         if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
           // Both wind speed and wind direction have the battery-empty value, publish an error message
+          Serial.println("Error: Battery is empty.");
           mqttClient.beginMessage(topic_errorMessage);
           mqttClient.print("Error: Battery is empty.");
           mqttClient.endMessage();
         } else if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
           String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
+
+          // Monitor data
+          Serial.print("Wind Speed: ");
+          Serial.println(data.windSpeed, 1);
+          Serial.print("Wind Direction: ");
+          Serial.println(data.windDirection);
 
           // Publish wind data via MQTT
           mqttClient.beginMessage(topic_windData, false, QoS, false);
@@ -159,14 +181,15 @@ static void vTaskDataHandler(void *pvParameters) {
             }
           } 
         } else {
-          Serial.println(ModbusRTUClient.lastError());
           // Publish error message via MQTT
+          Serial.println(ModbusRTUClient.lastError());
           mqttClient.beginMessage(topic_errorMessage);
           mqttClient.print("Error: Time Out.");
           mqttClient.endMessage();
         }
       } else {
         // Not connected to the MQTT broker, saves wind data to SD card
+        Serial.print("Failed to connect to MQTT broker!");
         if (data.windSpeedRaw != BATTERY_EMPTY_VALUE && data.windDirection != BATTERY_EMPTY_VALUE) {
           if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
             data.windSpeed = data.windSpeedRaw * 0.1;
@@ -194,42 +217,58 @@ static void vTaskDataHandler(void *pvParameters) {
       // clear the queue
       xQueueReset(queueWindDataMqtt);
     }
+
+    if (xQueueSend(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(100)) != pdPASS) {
+      // handle error...
+      Serial.println("Failed to send heartbeat from DataHandler task!");
+    }
     vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
   }  
 }
 
 //*****************************************************************************
 //
-// Function to monitor wind data.
+// Function to monitor task execution.
 //
 //*****************************************************************************
-static void vTaskMonitor(void *pvParameters) {
-  while(1) {
-    WindData data;
-    if (xQueueReceive(queueWindDataMonitor, &data, pdMS_TO_TICKS(100)) == pdPASS) {
-      if (mqttClient.connected()) {
-        if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
-          // Error message is displayed in the monitor when both wind speed and wind direction have the battery-empty value
-          Serial.println("Error: Battery is empty.");
-        } else if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
-          // Monitor data
-          Serial.print("Wind Speed: ");
-          Serial.println(data.windSpeed, 1);
-          Serial.print("Wind Direction: ");
-          Serial.println(data.windDirection);
-        } else {
-          Serial.println(ModbusRTUClient.lastError());
-        }
-      } else {
-        Serial.print("Failed to connect to MQTT broker!");
-      }
+static void vTaskWatchdog(void *pvParameters) {
+  while (1) {
+    bool receivedSensorHeartbeat = false;
+    bool receivedDataHandlerHeartbeat = false;
+    Heartbeat sensorHeartbeat;
+    Heartbeat dataHandlerHeartbeat;
+
+    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS) {
+      // Sign of life received from vTaskSensor
+      Serial.println("Received heartbeat from vTaskSensor");
+      // Serial.println(taskSensor);
+      receivedSensorHeartbeat = true;
     } else {
       // handle error...
-      Serial.println("Failed to receive data from the monitor queue!");
-      // clear the queue
-      xQueueReset(queueWindDataMonitor);
-    }  
-    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+      Serial.println("No heartbeat received from Sensor task!");
+    }
+
+    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS) {
+      // Sign of life received from vTaskDataHandler
+      Serial.println("Received heartbeat from vTaskDataHandler");
+      // Serial.println(taskDataHandler);
+      receivedDataHandlerHeartbeat = true;
+    } else {
+      // handle error...
+      Serial.println("No heartbeat received from DataHandler task!");
+    }
+
+    if (receivedSensorHeartbeat && receivedDataHandlerHeartbeat) {
+      if (sensorHeartbeat.sensor == true && dataHandlerHeartbeat.dataHandler == true){
+        Serial.println("Received heartbeats from both tasks");
+        wdt_reset();
+        Serial.println("Reset WDT");
+        receivedSensorHeartbeat = false;
+        receivedDataHandlerHeartbeat = false;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));  // delay for 1000 ms
   }
 }
 
@@ -272,12 +311,17 @@ void setup() {
   rtc.setMinutes(MINUTES);
   rtc.setSeconds(SECONDS);
 
+  // Initialize watchdog with 8 seconds (timeout)
+  wdt_init (WDT_CONFIG_PER_8K);
+  Serial.println("Watchdog enabled for: 8 s");
+
   // Create the queues
   queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));  
-  queueWindDataMonitor = xQueueCreate(10, sizeof(WindData));
+  queueHeartbeatSensor = xQueueCreate(5, sizeof(Heartbeat));
+  queueHeartbeatDataHandler = xQueueCreate(5, sizeof(Heartbeat));
   
   // Check if the queues were created successfully
-  if (queueWindDataMqtt == NULL || queueWindDataMonitor == NULL) {
+  if (queueWindDataMqtt == NULL || queueHeartbeatSensor == NULL || queueHeartbeatDataHandler == NULL) {
     Serial.println("Error: Failed to create one or more queues.");
 
     // Stop execution
@@ -287,7 +331,7 @@ void setup() {
   // Create tasks
   xTaskCreate(vTaskSensor, "Sensor data collection",                  256, NULL, tskIDLE_PRIORITY + 2, NULL);
   xTaskCreate(vTaskDataHandler, "Data processing and transmission",   512, NULL, tskIDLE_PRIORITY + 3, NULL);
-  xTaskCreate(vTaskMonitor, "System monitoring",                      128, NULL, tskIDLE_PRIORITY + 1, NULL);
+  xTaskCreate(vTaskWatchdog, "Watchdog timer",                        256, NULL, tskIDLE_PRIORITY + 1, NULL);
 
   // Start the FreeRTOS scheduler
   vTaskStartScheduler();
