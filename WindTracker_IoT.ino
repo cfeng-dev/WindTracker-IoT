@@ -6,7 +6,7 @@
   Once the internet is back, the stored data is then published again via the broker.
   
   The program uses the ArduinoModbus library and ArduinoRS485 library to communicate with the wind sensor,
-  the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, and SD library and RTCZero library 
+  the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, and SD library, NTPClient library and RTCZero library 
   to save the data with timestamp on the SD card, and the wdt_samd21 library to enable and manage the Watchdog Timer functionality.
 
   The implementation has been enhanced with the use of the FreeRTOS_SAMD21 library, enabling multitasking capabilities
@@ -40,14 +40,10 @@
 #include <ArduinoMqttClient.h>
 #include <MKRNB.h>
 #include <SD.h>
+#include <NTPClient.h>
 #include <RTCZero.h>
 #include <FreeRTOS_SAMD21.h>
 #include <wdt_samd21.h>
-
-// Set time (24-hour format)
-#define HOURS 18
-#define MINUTES 30
-#define SECONDS 0
 
 // Modbus configuration
 #define SLAVE_ID 0x090 // Device Address of the Ecowitt WS90 Wind Sensor
@@ -61,7 +57,8 @@ NBClient client;
 GPRS gprs;
 NB nbAccess;
 MqttClient mqttClient(client);
-RTCZero rtc; 
+RTCZero rtc;
+NBUDP ntpUDP;
 
 // MQTT configuration
 const char broker[] = "test.mosquitto.org";
@@ -69,6 +66,15 @@ const uint16_t port = 1883;
 const uint8_t QoS = 2;
 const char topic_windData[] = "Sensor_KN/Winddata";
 const char topic_errorMessage[] = "Sensor_KN/Error";
+
+// NTP Server Konfiguration
+long timeOffset = 3600 * 2; // Timezone offset in seconds (here: GMT+2)
+NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", timeOffset);
+
+// timeClient initializes to 14:30:00 if it does not receive an NTP packet 
+uint8_t HOUR = 14; // 24 hour format
+uint8_t MINUTE = 30;
+uint8_t SECOND = 0;
 
 // Define a structure to hold wind data
 struct WindData {
@@ -134,6 +140,13 @@ static void vTaskDataHandler(void *pvParameters) {
     byte hours = rtc.getHours();
     byte minutes = rtc.getMinutes();
     byte seconds = rtc.getSeconds();
+    Serial.print("Current time -> ");
+    Serial.print(hours);
+    Serial.print(":");
+    Serial.print(minutes);
+    Serial.print(":");
+    Serial.println(seconds);
+
     String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
     WindData data;
     Heartbeat dataHandlerHeartbeat;
@@ -238,36 +251,31 @@ static void vTaskWatchdog(void *pvParameters) {
     Heartbeat sensorHeartbeat;
     Heartbeat dataHandlerHeartbeat;
 
-    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS) {
+    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS && sensorHeartbeat.sensor == true) {
       // Sign of life received from vTaskSensor
       Serial.println("Received heartbeat from vTaskSensor");
       // Serial.println(taskSensor);
       receivedSensorHeartbeat = true;
     } else {
-      // handle error...
       Serial.println("No heartbeat received from Sensor task!");
     }
 
-    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS) {
+    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS && dataHandlerHeartbeat.dataHandler == true) {
       // Sign of life received from vTaskDataHandler
       Serial.println("Received heartbeat from vTaskDataHandler");
       // Serial.println(taskDataHandler);
       receivedDataHandlerHeartbeat = true;
     } else {
-      // handle error...
       Serial.println("No heartbeat received from DataHandler task!");
     }
 
     if (receivedSensorHeartbeat && receivedDataHandlerHeartbeat) {
-      if (sensorHeartbeat.sensor == true && dataHandlerHeartbeat.dataHandler == true){
-        Serial.println("Received heartbeats from both tasks");
-        wdt_reset();
-        Serial.println("Reset WDT");
-        receivedSensorHeartbeat = false;
-        receivedDataHandlerHeartbeat = false;
-      }
+      Serial.print("Received heartbeats from both tasks. ");
+      wdt_reset();
+      Serial.println("Reset WDT");
+      receivedSensorHeartbeat = false;
+      receivedDataHandlerHeartbeat = false;
     }
-
     vTaskDelay(pdMS_TO_TICKS(1000));  // delay for 1000 ms
   }
 }
@@ -281,12 +289,22 @@ void setup() {
       while (1);
     }
   }
+  for(int i = 0; i < 30; i++) {
+  Serial.println();
+  }
+
+  // Initialize watchdog with 8 seconds (timeout)
+  Serial.print("Initializing Watchdog timer (WDT)... ");
+  wdt_init (WDT_CONFIG_PER_8K);
+  Serial.println("Watchdog enabled for: 8 s");
 
   // Connect to NB IoT
+  Serial.print("Initializing NB IoT... ");
   if (!nbAccess.begin()) {
     Serial.println("Failed to start NB IoT!");
     while (1);
   }
+  Serial.println("NB IoT initialized.");
 
   // Initialize SD card
   Serial.print("Initializing SD card... ");
@@ -298,6 +316,7 @@ void setup() {
   }
 
   // Connect to MQTT
+  Serial.print("Connecting to MQTT broker... ");
   if (!mqttClient.connect(broker, port)) {
     Serial.print("Failed to connect to MQTT broker! Erroe code = ");
     Serial.println(mqttClient.connectError());
@@ -305,15 +324,36 @@ void setup() {
   }
   Serial.println("You're connected to the MQTT broker");
 
-  // Initialize RTC
-  rtc.begin();  
-  rtc.setHours(HOURS);
-  rtc.setMinutes(MINUTES);
-  rtc.setSeconds(SECONDS);
+  // Initialize time
+  timeClient.begin();
+  timeClient.forceUpdate();
+  Serial.print("Initializing time... ");
+  if (!timeClient.isTimeSet()) {
+    Serial.print("Failed to receive NTP packet and set time! Retry... "); 
+    delay(1000);
+    timeClient.forceUpdate();
+    if (!timeClient.isTimeSet()) {
+      Serial.print("Failed to receive NTP packet and set time... ");
+      Serial.println("Set time to 14:30:00 (default)");
+    } else {
+      HOUR = timeClient.getHours() + timeOffset;
+      MINUTE = timeClient.getMinutes();
+      SECOND = timeClient.getSeconds();
+      Serial.println("Time initialized.");
+    }
+  } else {
+    HOUR = timeClient.getHours() + timeOffset;
+    MINUTE = timeClient.getMinutes();
+    SECOND = timeClient.getSeconds();
+    Serial.println("Time initialized.");
+  }
+  timeClient.end();
 
-  // Initialize watchdog with 8 seconds (timeout)
-  wdt_init (WDT_CONFIG_PER_8K);
-  Serial.println("Watchdog enabled for: 8 s");
+  // Initialize RTC
+  rtc.begin();
+  rtc.setHours(HOUR);
+  rtc.setMinutes(MINUTE);
+  rtc.setSeconds(SECOND);
 
   // Create the queues
   queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));  
@@ -339,7 +379,6 @@ void setup() {
   // Should never get here
   while (1) {
 	  Serial.println("Scheduler Failed!");
-	  Serial.flush();
 	  delay(1000);
   }
 }
