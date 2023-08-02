@@ -49,7 +49,6 @@
 #define SLAVE_ID 0x090 // Device Address of the Ecowitt WS90 Wind Sensor
 #define WIND_SPEED_REGISTER 0x0169 // Register address of the wind speed
 #define WIND_DIRECTION_REGISTER 0x016B // Register address of the wind direction
-#define BATTERY_EMPTY_VALUE 65535 // Battery-empty state
 #define TIME_OUT -1
 
 // Initialize library instance
@@ -78,8 +77,8 @@ uint8_t SECOND = 0;
 
 // Define a structure to hold wind data
 struct WindData {
-  uint16_t windSpeedRaw;
-  uint16_t windDirection;
+  uint windSpeedRaw;
+  uint windDirection;
   float windSpeed;
 };
 
@@ -95,7 +94,7 @@ QueueHandle_t queueHeartbeatDataHandler;
 
 //*****************************************************************************
 //
-// Function to handle sensor data collection and distribution.
+// Thread to handle sensor data collection and distribution.
 //
 //*****************************************************************************
 static void vTaskSensor(void *pvParameters) {
@@ -127,7 +126,7 @@ static void vTaskSensor(void *pvParameters) {
 
 //*****************************************************************************
 //
-// Function to handle the processing of wind data:
+// Thread to handle the processing of wind data:
 //
 // 1. If connected to the MQTT broker, validates the wind data and sends the formatted data to the broker.
 // 2. If not connected to the MQTT broker, saves wind data to SD card.
@@ -154,76 +153,55 @@ static void vTaskDataHandler(void *pvParameters) {
     if (xQueueReceive(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) == pdPASS) {
       dataHandlerHeartbeat.sensor = false;
       dataHandlerHeartbeat.dataHandler = true;
-      if (mqttClient.connected()) {
-        // Connection to MQTT broker
-        if (data.windSpeedRaw == BATTERY_EMPTY_VALUE || data.windDirection == BATTERY_EMPTY_VALUE) {
-          // Both wind speed and wind direction have the battery-empty value, publish an error message
-          Serial.println("Error: Battery is empty.");
-          mqttClient.beginMessage(topic_errorMessage);
-          mqttClient.print("Error: Battery is empty.");
-          mqttClient.endMessage();
-        } else if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
-          String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
 
-          // Monitor data
-          Serial.print("Wind Speed: ");
-          Serial.println(data.windSpeed, 1);
-          Serial.print("Wind Direction: ");
-          Serial.println(data.windDirection);
+      if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
+        String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
 
+        // Monitor data
+        Serial.print("Wind Speed: ");
+        Serial.println(data.windSpeed, 1);
+        Serial.print("Wind Direction: ");
+        Serial.println(data.windDirection);
+
+        if (mqttClient.connected()) {
           // Publish wind data via MQTT
           mqttClient.beginMessage(topic_windData, false, QoS, false);
           mqttClient.print(dataString);
           mqttClient.endMessage();
 
           // Read and send data from SD Card
-          if (SD.exists("winddata.txt")) {
-            File dataFile = SD.open("winddata.txt");
-            if (dataFile) {
-              String dataString;
-              while (dataFile.available()) {
-                dataString = dataFile.readStringUntil('\n');
-                mqttClient.beginMessage(topic_windData, false, QoS, false);
-                mqttClient.print(dataString);
-                mqttClient.endMessage();
-              }
-              dataFile.close();
-              SD.remove("winddata.txt");
-            } else {
-              Serial.println("Error opening winddata.txt");
-            }
-          } 
+          readAndSendDataFromSDCard();
         } else {
-          // Publish error message via MQTT
-          Serial.println(ModbusRTUClient.lastError());
-          mqttClient.beginMessage(topic_errorMessage);
-          mqttClient.print("Error: Time Out.");
-          mqttClient.endMessage();
+          // Try to reconnect to the MQTT broker
+          int connectionResult = mqttClient.connect(broker, port);
+          // Check if the reconnection was successful
+          if (connectionResult == MQTT_SUCCESS) {
+            // Connection is successful
+            Serial.println("Reconnection is successful");
+            mqttClient.beginMessage(topic_windData, false, QoS, false);
+            mqttClient.print(dataString);
+            mqttClient.endMessage();
+
+            // Read and send data from SD Card
+            readAndSendDataFromSDCard();
+          } else {
+            // Connection failed, handle the error
+            Serial.print("Failed to connect to MQTT broker, error code: ");
+            Serial.println(connectionResult);
+
+            // Save wind data to SD card
+            saveDataToSDCard(dataString);
+          }
         }
       } else {
-        // Not connected to the MQTT broker, saves wind data to SD card
-        Serial.print("Failed to connect to MQTT broker!");
-        if (data.windSpeedRaw != BATTERY_EMPTY_VALUE && data.windDirection != BATTERY_EMPTY_VALUE) {
-          if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
-            data.windSpeed = data.windSpeedRaw * 0.1;
-            String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
-            File dataFile = SD.open("winddata.txt", FILE_WRITE);
-            if (dataFile) {
-              dataFile.println(dataString);
-              Serial.print(dataString);
-              Serial.println(" ...saved");
-              dataFile.close();
-            } else {
-              Serial.println("Error opening winddata.txt");
-            }
-          } else {
-            Serial.println(ModbusRTUClient.lastError());
-          }
-        } else {
-        Serial.println("Error: Battery is empty.");
-        }  
+        Serial.println(ModbusRTUClient.lastError());
+        if (mqttClient.connected()) {
+          // Publish error message via MQTT
+          mqttClient.beginMessage(topic_errorMessage);
+          mqttClient.print(ModbusRTUClient.lastError());
+          mqttClient.endMessage();
+        }
       }
-    
     } else {
       // handle error...
       Serial.println("Failed to receive data from the MQTT queue!");
@@ -241,7 +219,7 @@ static void vTaskDataHandler(void *pvParameters) {
 
 //*****************************************************************************
 //
-// Function to monitor task execution.
+// Thread to monitor task execution.
 //
 //*****************************************************************************
 static void vTaskWatchdog(void *pvParameters) {
@@ -251,19 +229,17 @@ static void vTaskWatchdog(void *pvParameters) {
     Heartbeat sensorHeartbeat;
     Heartbeat dataHandlerHeartbeat;
 
-    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS && sensorHeartbeat.sensor == true) {
+    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(100)) == pdPASS && sensorHeartbeat.sensor == true) {
       // Sign of life received from vTaskSensor
       Serial.println("Received heartbeat from vTaskSensor");
-      // Serial.println(taskSensor);
       receivedSensorHeartbeat = true;
     } else {
       Serial.println("No heartbeat received from Sensor task!");
     }
 
-    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(6000)) == pdPASS && dataHandlerHeartbeat.dataHandler == true) {
+    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(100)) == pdPASS && dataHandlerHeartbeat.dataHandler == true) {
       // Sign of life received from vTaskDataHandler
       Serial.println("Received heartbeat from vTaskDataHandler");
-      // Serial.println(taskDataHandler);
       receivedDataHandlerHeartbeat = true;
     } else {
       Serial.println("No heartbeat received from DataHandler task!");
@@ -276,7 +252,56 @@ static void vTaskWatchdog(void *pvParameters) {
       receivedSensorHeartbeat = false;
       receivedDataHandlerHeartbeat = false;
     }
-    vTaskDelay(pdMS_TO_TICKS(1000));  // delay for 1000 ms
+    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+  }
+}
+
+//*****************************************************************************
+//
+// Function to read stored wind data from the SD card and publish it via MQTT.
+//
+//*****************************************************************************
+void readAndSendDataFromSDCard() {
+  if (SD.exists("winddata.txt")) {
+    // now disable WDT
+    wdt_disable();
+    Serial.println("WDT disabled...");
+
+    File dataFile = SD.open("winddata.txt");
+    if (dataFile) {
+      String dataString;
+      while (dataFile.available()) {
+        dataString = dataFile.readStringUntil('\n');
+        mqttClient.beginMessage(topic_windData, false, QoS, false);
+        mqttClient.print(dataString);
+        mqttClient.endMessage();
+      }
+      dataFile.close();
+      SD.remove("winddata.txt");
+
+      // now enable WDT again
+      wdt_reEnable();
+      Serial.println("WDT reEnabled...");
+    } else {
+      Serial.println("Error opening winddata.txt");
+    }
+  }
+}
+
+//*****************************************************************************
+//
+// Function to save wind speed and wind direction with the current timestamp on the SD card.
+//
+//*****************************************************************************
+void saveDataToSDCard(String dataString) {
+  File dataFile = SD.open("winddata.txt", FILE_WRITE);
+  if (dataFile) {
+    dataFile.println(dataString);
+    Serial.print(dataString);
+    Serial.println(" ...saved");
+    dataFile.close();
+  } else {
+    Serial.println("Error opening winddata.txt");
   }
 }
 
@@ -292,11 +317,6 @@ void setup() {
   for(int i = 0; i < 30; i++) {
   Serial.println();
   }
-
-  // Initialize watchdog with 8 seconds (timeout)
-  Serial.print("Initializing Watchdog timer (WDT)... ");
-  wdt_init (WDT_CONFIG_PER_8K);
-  Serial.println("Watchdog enabled for: 8 s");
 
   // Connect to NB IoT
   Serial.print("Initializing NB IoT... ");
@@ -330,7 +350,7 @@ void setup() {
   Serial.print("Initializing time... ");
   if (!timeClient.isTimeSet()) {
     Serial.print("Failed to receive NTP packet and set time! Retry... "); 
-    delay(1000);
+    delay(3000);
     timeClient.forceUpdate();
     if (!timeClient.isTimeSet()) {
       Serial.print("Failed to receive NTP packet and set time... ");
@@ -355,8 +375,13 @@ void setup() {
   rtc.setMinutes(MINUTE);
   rtc.setSeconds(SECOND);
 
+  // Initialize watchdog with 8 seconds (timeout)
+  Serial.print("Initializing Watchdog timer (WDT)... ");
+  wdt_init (WDT_CONFIG_PER_8K);
+  Serial.println("Watchdog enabled for: 8 s");
+
   // Create the queues
-  queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));  
+  queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));
   queueHeartbeatSensor = xQueueCreate(5, sizeof(Heartbeat));
   queueHeartbeatDataHandler = xQueueCreate(5, sizeof(Heartbeat));
   
