@@ -44,6 +44,7 @@
 #include <RTCZero.h>
 #include <FreeRTOS_SAMD21.h>
 #include <wdt_samd21.h>
+#include "SIM_Card_Secrets.h"
 
 // Modbus configuration
 #define SLAVE_ID 0x090 // Device Address of the Ecowitt WS90 Wind Sensor
@@ -58,6 +59,9 @@ NB nbAccess;
 MqttClient mqttClient(client);
 RTCZero rtc;
 NBUDP ntpUDP;
+
+// If your SIM card has a PIN number, please enter it in the "SIM_Card_Secrets.h"
+const char PINNUMBER[] = SECRET_PINNUMBER;
 
 // MQTT configuration
 const char broker[] = "test.mosquitto.org";
@@ -320,7 +324,7 @@ void setup() {
 
   // Connect to NB IoT
   Serial.print("Initializing NB IoT... ");
-  if (!nbAccess.begin()) {
+  if (nbAccess.begin(PINNUMBER) != NB_READY) {
     Serial.println("Failed to start NB IoT!");
     while (1);
   }
