@@ -44,6 +44,7 @@
 #include <RTCZero.h>
 #include <FreeRTOS_SAMD21.h>
 #include <wdt_samd21.h>
+#include <ArduinoJson.h>
 #include "SIM_Card_Secrets.h"
 
 // Modbus configuration
@@ -93,172 +94,8 @@ struct Heartbeat {
 };
 
 QueueHandle_t queueWindDataMqtt; // Handle to the queue storing data destined for MQTT communication
-QueueHandle_t queueHeartbeatSensor; // Handle to the queue storing data destined for system monitoring
-QueueHandle_t queueHeartbeatDataHandler;
-
-//*****************************************************************************
-//
-// Thread to handle sensor data collection and distribution.
-//
-//*****************************************************************************
-static void vTaskSensor(void *pvParameters) {
-  while(1) {
-    WindData data;
-    Heartbeat sensorHeartbeat;
-    // Read wind speed register and wind direction register
-    data.windSpeedRaw = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_SPEED_REGISTER);
-    data.windDirection = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_DIRECTION_REGISTER);
-    data.windSpeed = data.windSpeedRaw * 0.1; // Convert raw wind speed to actual wind speed
-    sensorHeartbeat.sensor = true;
-    sensorHeartbeat.dataHandler = false;
-
-    // Send data to the queues, block for max. 100 ms if the queue is full
-    if (xQueueSend(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) != pdPASS) {
-      // handle error...
-      Serial.println("Failed to send data to MQTT queue!");
-      // Retry sending data to the queue
-      vTaskDelay(pdMS_TO_TICKS(200));  // delay for 200 ms before retry
-      xQueueSend(queueWindDataMqtt, &data, portMAX_DELAY);  // try sending again with indefinite blocking
-    }
-    if (xQueueSend(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(100)) != pdPASS) {
-      // handle error...
-      Serial.println("Failed to send heartbeat from Sensor task!");
-    }
-    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
-  }
-}
-
-//*****************************************************************************
-//
-// Thread to handle the processing of wind data:
-//
-// 1. If connected to the MQTT broker, validates the wind data and sends the formatted data to the broker.
-// 2. If not connected to the MQTT broker, saves wind data to SD card.
-// 3. If data exists on the SD card (i.e., when MQTT connection was previously unavailable), sends this data to the MQTT broker.
-//
-//*****************************************************************************
-static void vTaskDataHandler(void *pvParameters) {
-  while(1) {
-    // Current time
-    byte hours = rtc.getHours();
-    byte minutes = rtc.getMinutes();
-    byte seconds = rtc.getSeconds();
-    Serial.print("Current time -> ");
-    Serial.print(hours);
-    Serial.print(":");
-    Serial.print(minutes);
-    Serial.print(":");
-    Serial.println(seconds);
-
-    String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
-    WindData data;
-    Heartbeat dataHandlerHeartbeat;
-
-    if (xQueueReceive(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) == pdPASS) {
-      dataHandlerHeartbeat.sensor = false;
-      dataHandlerHeartbeat.dataHandler = true;
-
-      if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
-        String dataString = timestamp + "," + String(data.windSpeed, 1) + "," + String(data.windDirection); // format in string
-
-        // Monitor data
-        Serial.print("Wind Speed: ");
-        Serial.println(data.windSpeed, 1);
-        Serial.print("Wind Direction: ");
-        Serial.println(data.windDirection);
-
-        if (mqttClient.connected()) {
-          // Publish wind data via MQTT
-          mqttClient.beginMessage(topic_windData, false, QoS, false);
-          mqttClient.print(dataString);
-          mqttClient.endMessage();
-
-          // Read and send data from SD Card
-          readAndSendDataFromSDCard();
-        } else {
-          // Try to reconnect to the MQTT broker
-          int connectionResult = mqttClient.connect(broker, port);
-          // Check if the reconnection was successful
-          if (connectionResult == MQTT_SUCCESS) {
-            // Connection is successful
-            Serial.println("Reconnection is successful");
-            mqttClient.beginMessage(topic_windData, false, QoS, false);
-            mqttClient.print(dataString);
-            mqttClient.endMessage();
-
-            // Read and send data from SD Card
-            readAndSendDataFromSDCard();
-          } else {
-            // Connection failed, handle the error
-            Serial.print("Failed to connect to MQTT broker, error code: ");
-            Serial.println(connectionResult);
-
-            // Save wind data to SD card
-            saveDataToSDCard(dataString);
-          }
-        }
-      } else {
-        Serial.println(ModbusRTUClient.lastError());
-        if (mqttClient.connected()) {
-          // Publish error message via MQTT
-          mqttClient.beginMessage(topic_errorMessage);
-          mqttClient.print(ModbusRTUClient.lastError());
-          mqttClient.endMessage();
-        }
-      }
-    } else {
-      // handle error...
-      Serial.println("Failed to receive data from the MQTT queue!");
-      // clear the queue
-      xQueueReset(queueWindDataMqtt);
-    }
-
-    if (xQueueSend(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(100)) != pdPASS) {
-      // handle error...
-      Serial.println("Failed to send heartbeat from DataHandler task!");
-    }
-    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
-  }  
-}
-
-//*****************************************************************************
-//
-// Thread to monitor task execution.
-//
-//*****************************************************************************
-static void vTaskWatchdog(void *pvParameters) {
-  while (1) {
-    bool receivedSensorHeartbeat = false;
-    bool receivedDataHandlerHeartbeat = false;
-    Heartbeat sensorHeartbeat;
-    Heartbeat dataHandlerHeartbeat;
-
-    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(100)) == pdPASS && sensorHeartbeat.sensor == true) {
-      // Sign of life received from vTaskSensor
-      Serial.println("Received heartbeat from vTaskSensor");
-      receivedSensorHeartbeat = true;
-    } else {
-      Serial.println("No heartbeat received from Sensor task!");
-    }
-
-    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(100)) == pdPASS && dataHandlerHeartbeat.dataHandler == true) {
-      // Sign of life received from vTaskDataHandler
-      Serial.println("Received heartbeat from vTaskDataHandler");
-      receivedDataHandlerHeartbeat = true;
-    } else {
-      Serial.println("No heartbeat received from DataHandler task!");
-    }
-
-    if (receivedSensorHeartbeat && receivedDataHandlerHeartbeat) {
-      Serial.print("Received heartbeats from both tasks. ");
-      wdt_reset();
-      Serial.println("Reset WDT");
-      receivedSensorHeartbeat = false;
-      receivedDataHandlerHeartbeat = false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
-  }
-}
+QueueHandle_t queueHeartbeatSensor; // Handle to the queue storing vTaskSensor heartbeat destined for system monitoring
+QueueHandle_t queueHeartbeatDataHandler; // Handle to the queue storing vTaskDataHandler heartbeat destined for system monitoring
 
 //*****************************************************************************
 //
@@ -269,11 +106,11 @@ void readAndSendDataFromSDCard() {
   if (SD.exists("winddata.txt")) {
     // now disable WDT
     wdt_disable();
-    Serial.println("WDT disabled...");
 
     File dataFile = SD.open("winddata.txt");
     if (dataFile) {
       String dataString;
+      Serial.print("Sending data... ");
       while (dataFile.available()) {
         dataString = dataFile.readStringUntil('\n');
         mqttClient.beginMessage(topic_windData, false, QoS, false);
@@ -282,10 +119,10 @@ void readAndSendDataFromSDCard() {
       }
       dataFile.close();
       SD.remove("winddata.txt");
+      Serial.println("Finish");
 
       // now enable WDT again
       wdt_reEnable();
-      Serial.println("WDT reEnabled...");
     } else {
       Serial.println("Error opening winddata.txt");
     }
@@ -309,6 +146,183 @@ void saveDataToSDCard(String dataString) {
   }
 }
 
+//*****************************************************************************
+//
+// Thread to handle sensor data collection and distribution.
+//
+//*****************************************************************************
+static void vTaskSensor(void *pvParameters) {
+  TaskStatus_t xTaskDetails; // structure to hold the task's details
+
+  while(1) {
+    WindData data;
+    Heartbeat sensorHeartbeat;
+    // Read wind speed register and wind direction register
+    data.windSpeedRaw = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_SPEED_REGISTER);
+    data.windDirection = ModbusRTUClient.holdingRegisterRead(SLAVE_ID, WIND_DIRECTION_REGISTER);
+    data.windSpeed = data.windSpeedRaw * 0.1; // Convert raw wind speed to actual wind speed
+    sensorHeartbeat.sensor = true;
+    sensorHeartbeat.dataHandler = false;
+
+    // Send data to the queues, block for max. 100 ms if the queue is full
+    if (xQueueSend(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) != pdPASS) {
+      // handle error...
+      Serial.println("Failed to send data to MQTT queue!");
+      // Retry sending data to the queue
+      vTaskDelay(pdMS_TO_TICKS(200));  // delay for 200 ms before retry
+      xQueueSend(queueWindDataMqtt, &data, portMAX_DELAY);  // try sending again with indefinite blocking
+    }
+    if (xQueueSend(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(100)) != pdPASS) {
+      // handle error...
+      Serial.println("Failed to send heartbeat from Sensor task!");
+    }
+
+    // Check the task's stack
+    vTaskGetInfo(NULL, &xTaskDetails, pdTRUE, eInvalid);
+    Serial.print("vTaskSensor free stack space: ");
+    Serial.println(xTaskDetails.usStackHighWaterMark);
+
+    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+  }
+}
+
+//*****************************************************************************
+//
+// Thread to handle the processing of wind data:
+//
+// 1. If connected to the MQTT broker, validates the wind data and sends the formatted data to the broker.
+// 2. If not connected to the MQTT broker, saves wind data to SD card.
+// 3. If data exists on the SD card (i.e., when MQTT connection was previously unavailable), sends this data to the MQTT broker.
+//
+//*****************************************************************************
+static void vTaskDataHandler(void *pvParameters) {
+  TaskStatus_t xTaskDetails; // structure to hold the task's details
+
+  while(1) {
+    // Current time
+    byte hours = rtc.getHours();
+    byte minutes = rtc.getMinutes();
+    byte seconds = rtc.getSeconds();
+
+    String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
+    WindData data;
+    Heartbeat dataHandlerHeartbeat;
+    String dataString;
+    DynamicJsonDocument doc(128);
+
+    // Create object "Received".
+    JsonObject received = doc.createNestedObject("Received");
+
+    if (xQueueReceive(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) == pdPASS) {
+      dataHandlerHeartbeat.sensor = false;
+      dataHandlerHeartbeat.dataHandler = true;
+
+      if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
+        // Add values to the Received object
+        received["windSpeed"] = String(data.windSpeed, 1);
+        received["windDirection"] = String(data.windDirection);
+        received["timestamp"] = timestamp;
+        serializeJson(doc, dataString); // format in JSON
+
+        // Monitor data
+        Serial.println("******************************");
+        Serial.print("Wind Speed: ");
+        Serial.println(data.windSpeed, 1);
+        Serial.print("Wind Direction: ");
+        Serial.println(data.windDirection);
+        Serial.print("Timestamp: ");
+        Serial.println(timestamp);
+        Serial.println("******************************");
+
+        if (mqttClient.connected()) {
+          // Publish wind data via MQTT
+          mqttClient.beginMessage(topic_windData, false, QoS, false);
+          mqttClient.print(dataString);
+          mqttClient.endMessage();
+
+          // Read and send data from SD Card
+          readAndSendDataFromSDCard();
+        } else {
+          // Connection failed, handle the error
+          Serial.println("Failed to connect to MQTT broker");
+
+          // Save wind data to SD card
+          saveDataToSDCard(dataString);
+        }
+      } else {
+         Serial.println(ModbusRTUClient.lastError());
+         if (mqttClient.connected()) {
+           // Publish error message via MQTT
+           mqttClient.beginMessage(topic_errorMessage);
+           mqttClient.print(ModbusRTUClient.lastError());
+           mqttClient.endMessage();
+         }
+      }
+    } else {
+      // handle error...
+      Serial.println("Failed to receive data from the MQTT queue!");
+      // clear the queue
+      xQueueReset(queueWindDataMqtt);
+    }
+
+    if (xQueueSend(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(100)) != pdPASS) {
+      // handle error...
+      Serial.println("Failed to send heartbeat from DataHandler task!");
+    }
+
+    // Check the task's stack
+    vTaskGetInfo(NULL, &xTaskDetails, pdTRUE, eInvalid);
+    Serial.print("vTaskDataHandler free stack space: ");
+    Serial.println(xTaskDetails.usStackHighWaterMark);
+
+    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+  }  
+}
+
+//*****************************************************************************
+//
+// Thread to monitor task execution.
+//
+//*****************************************************************************
+static void vTaskWatchdog(void *pvParameters) {
+  TaskStatus_t xTaskDetails; // structure to hold the task's details
+
+  while (1) {
+    bool receivedSensorHeartbeat = false;
+    bool receivedDataHandlerHeartbeat = false;
+    Heartbeat sensorHeartbeat;
+    Heartbeat dataHandlerHeartbeat;
+
+    if (xQueueReceive(queueHeartbeatSensor, &sensorHeartbeat, pdMS_TO_TICKS(100)) == pdPASS && sensorHeartbeat.sensor == true) {
+      // Sign of life received from vTaskSensor
+      receivedSensorHeartbeat = true;
+    } else {
+      Serial.println("No heartbeat received from Sensor task!");
+    }
+
+    if (xQueueReceive(queueHeartbeatDataHandler, &dataHandlerHeartbeat, pdMS_TO_TICKS(100)) == pdPASS && dataHandlerHeartbeat.dataHandler == true) {
+      // Sign of life received from vTaskDataHandler
+      receivedDataHandlerHeartbeat = true;
+    } else {
+      Serial.println("No heartbeat received from DataHandler task!");
+    }
+
+    if (receivedSensorHeartbeat && receivedDataHandlerHeartbeat) {
+      Serial.println("Received heartbeats from both tasks");
+      wdt_reset();
+      receivedSensorHeartbeat = false;
+      receivedDataHandlerHeartbeat = false;
+    }
+
+    // Check the task's stack
+    vTaskGetInfo(NULL, &xTaskDetails, pdTRUE, eInvalid);
+    Serial.print("vTaskWatchdog free stack space: ");
+    Serial.println(xTaskDetails.usStackHighWaterMark);
+
+    vTaskDelay(pdMS_TO_TICKS(4500)); // delay for 4500 ms
+  }
+}
+
 void setup() {
   Serial.begin(9600);
   while(!Serial){
@@ -321,6 +335,10 @@ void setup() {
   for(int i = 0; i < 30; i++) {
   Serial.println();
   }
+
+  Serial.println("******************************");
+  Serial.println("        Program start         ");
+  Serial.println("******************************");
 
   // Connect to NB IoT
   Serial.print("Initializing NB IoT... ");
@@ -379,10 +397,21 @@ void setup() {
   rtc.setMinutes(MINUTE);
   rtc.setSeconds(SECOND);
 
+  // Current time
+  byte hours = rtc.getHours();
+  byte minutes = rtc.getMinutes();
+  byte seconds = rtc.getSeconds();
+  Serial.print("Current time -> ");
+  Serial.print(hours);
+  Serial.print(":");
+  Serial.print(minutes);
+  Serial.print(":");
+  Serial.println(seconds);
+
   // Initialize watchdog with 8 seconds (timeout)
   Serial.print("Initializing Watchdog timer (WDT)... ");
-  wdt_init (WDT_CONFIG_PER_8K);
-  Serial.println("Watchdog enabled for: 8 s");
+  wdt_init (WDT_CONFIG_PER_16K);
+  Serial.println("Watchdog enabled for 16 seconds");
 
   // Create the queues
   queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));
@@ -399,8 +428,8 @@ void setup() {
 
   // Create tasks
   xTaskCreate(vTaskSensor, "Sensor data collection",                  256, NULL, tskIDLE_PRIORITY + 2, NULL);
-  xTaskCreate(vTaskDataHandler, "Data processing and transmission",   512, NULL, tskIDLE_PRIORITY + 3, NULL);
-  xTaskCreate(vTaskWatchdog, "Watchdog timer",                        256, NULL, tskIDLE_PRIORITY + 1, NULL);
+  xTaskCreate(vTaskDataHandler, "Data processing and transmission",   650, NULL, tskIDLE_PRIORITY + 3, NULL);
+  xTaskCreate(vTaskWatchdog, "Watchdog timer",                        128, NULL, tskIDLE_PRIORITY + 1, NULL);
 
   // Start the FreeRTOS scheduler
   vTaskStartScheduler();
