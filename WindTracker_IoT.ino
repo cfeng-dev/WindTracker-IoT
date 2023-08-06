@@ -197,6 +197,11 @@ static void vTaskSensor(void *pvParameters) {
 //*****************************************************************************
 static void vTaskDataHandler(void *pvParameters) {
   TaskStatus_t xTaskDetails; // structure to hold the task's details
+  const int BASE_FAILURES = 10;  // Base value for failed attempts
+  const int MAX_FAILURES = 800;  // Maximum number of failed attempts before reconnecting
+  static int failureCount = 0; // Counter for consecutive connection errors
+  int maxFailures = BASE_FAILURES; // maximum number of connection errors
+  const int BACKOFF_FACTOR = 2;
 
   while(1) {
     // Current time
@@ -242,12 +247,32 @@ static void vTaskDataHandler(void *pvParameters) {
 
           // Read and send data from SD Card
           readAndSendDataFromSDCard();
+
+          failureCount = 0; // Reset the failed attempt counter since there is a successful connection
+          maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
         } else {
+          failureCount++;
+
           // Connection failed, handle the error
           Serial.println("Failed to connect to MQTT broker");
 
           // Save wind data to SD card
           saveDataToSDCard(dataString);
+
+          if (failureCount >= maxFailures) {
+            // Attempt to reconnect to the broker
+            if (mqttClient.connect(broker, port)) {
+              Serial.println("Reconnected to MQTT broker");
+              failureCount = 0; // Reset the failed attempt counter
+              maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
+            } else {
+              Serial.println("Reconnection attempt failed");
+              maxFailures *= BACKOFF_FACTOR;  // Increase the number of failures before next reconnection attempt
+              if (maxFailures > MAX_FAILURES) {
+                maxFailures = MAX_FAILURES;  // Cap it to a maximum value
+              }
+            }
+          }
         }
       } else {
          Serial.println(ModbusRTUClient.lastError());
@@ -408,7 +433,7 @@ void setup() {
   Serial.print(":");
   Serial.println(seconds);
 
-  // Initialize watchdog with 8 seconds (timeout)
+  // Initialize watchdog with 16 seconds (timeout)
   Serial.print("Initializing Watchdog timer (WDT)... ");
   wdt_init (WDT_CONFIG_PER_16K);
   Serial.println("Watchdog enabled for 16 seconds");
