@@ -223,7 +223,7 @@ static void vTaskDataHandler(void *pvParameters) {
       dataHandlerHeartbeat.dataHandler = true;
 
       if (data.windSpeedRaw != TIME_OUT && data.windDirection != TIME_OUT) {
-        // Add values to the Received object
+        // Add values to the "Received" object
         received["windSpeed"] = String(data.windSpeed, 1);
         received["windDirection"] = String(data.windDirection);
         received["timestamp"] = timestamp;
@@ -239,30 +239,57 @@ static void vTaskDataHandler(void *pvParameters) {
         Serial.println(timestamp);
         Serial.println("******************************");
 
-        if (mqttClient.connected()) {
-          // Publish wind data via MQTT
-          mqttClient.beginMessage(topic_windData, false, QoS, false);
-          mqttClient.print(dataString);
-          mqttClient.endMessage();
+        // Check if the connection to the cellular network (NB IoT) is ready
+        if (nbAccess.status() == NB_READY && gprs.status() == GPRS_READY) {
+          // Check if the MQTT client is successfully connected to the broker
+          if (mqttClient.connected()) {
+            // Publish wind data via MQTT
+            mqttClient.beginMessage(topic_windData, false, QoS, false);
+            mqttClient.print(dataString);
+            mqttClient.endMessage();
 
-          // Read and send data from SD Card
-          readAndSendDataFromSDCard();
+            // Read and send data from SD Card
+            readAndSendDataFromSDCard();
 
-          failureCount = 0; // Reset the failed attempt counter since there is a successful connection
-          maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
+            failureCount = 0; // Reset the failed attempt counter since there is a successful connection
+            maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
+          } else {
+            failureCount++;
+
+            // Connection with MQTT broker failed, handle the error
+            Serial.println("Failed to connect to MQTT broker");
+
+            // Save wind data to SD card
+            saveDataToSDCard(dataString);
+
+            if (failureCount >= maxFailures) {
+              // Attempt to reconnect to the broker
+              if (mqttClient.connect(broker, port)) {
+                Serial.println("Reconnected to MQTT broker");
+                failureCount = 0; // Reset the failed attempt counter
+                maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
+              } else {
+                Serial.println("Reconnection attempt failed");
+                maxFailures *= BACKOFF_FACTOR;  // Increase the number of failures before next reconnection attempt
+                if (maxFailures > MAX_FAILURES) {
+                  maxFailures = MAX_FAILURES;  // Cap it to a maximum value
+                }
+              }
+            }
+          }
         } else {
           failureCount++;
 
-          // Connection failed, handle the error
-          Serial.println("Failed to connect to MQTT broker");
+          // Connection with cellular network failed, handle the error
+          Serial.println("Failed to connect to cellular network (NB IoT)");
 
           // Save wind data to SD card
           saveDataToSDCard(dataString);
 
           if (failureCount >= maxFailures) {
-            // Attempt to reconnect to the broker
-            if (mqttClient.connect(broker, port)) {
-              Serial.println("Reconnected to MQTT broker");
+            // Attempt to reconnect to the cellular network
+            if ((nbAccess.begin(PINNUMBER) == NB_READY) && (gprs.attachGPRS() == GPRS_READY)) {
+              Serial.println("Reconnected to cellular network");
               failureCount = 0; // Reset the failed attempt counter
               maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
             } else {
