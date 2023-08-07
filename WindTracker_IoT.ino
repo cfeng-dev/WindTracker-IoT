@@ -80,6 +80,13 @@ uint8_t HOUR = 14; // 24 hour format
 uint8_t MINUTE = 30;
 uint8_t SECOND = 0;
 
+// Connection counter configuration
+const int BASE_FAILURES = 10;  // Base value for failed attempts
+const int MAX_FAILURES = 800;  // Maximum number of failed attempts before reconnecting
+static int failureCount = 0; // Counter for consecutive connection errors
+int maxFailures = BASE_FAILURES; // Maximum number of connection errors
+const int BACKOFF_FACTOR = 2;
+
 // Define a structure to hold wind data
 struct WindData {
   uint windSpeedRaw;
@@ -148,13 +155,77 @@ void saveDataToSDCard(String dataString) {
 
 //*****************************************************************************
 //
+// Function to reset the counters related to connection failures.
+//
+//*****************************************************************************
+void resetFailureCounters() {
+  failureCount = 0; // Reset the failed attempt counter since there is a successful connection
+  maxFailures = BASE_FAILURES; // Reset maxFailures to the base value
+}
+
+//*****************************************************************************
+//
+// Function to check the connectivity status of the cellular network (NB IoT).
+//
+//*****************************************************************************
+bool isConnectedToCellular() {
+  // Returns true if connected, false otherwise.
+  return (nbAccess.status() == NB_READY && gprs.status() == GPRS_READY);
+}
+
+//*****************************************************************************
+//
+// Function to handle reconnection attempts to the MQTT broker.
+//
+//*****************************************************************************
+void handleMQTTReconnection() {
+  failureCount++;
+  Serial.println("Failed to connect to MQTT broker");
+  if (failureCount >= maxFailures) {
+    if (mqttClient.connect(broker, port)) {
+      Serial.println("Reconnected to MQTT broker");
+      resetFailureCounters();
+    } else {
+      Serial.println("Reconnection attempt failed");
+      maxFailures *= BACKOFF_FACTOR; // Increase the number of failures before next reconnection attempt
+      if (maxFailures > MAX_FAILURES) {
+        maxFailures = MAX_FAILURES; // Cap it to a maximum value
+      }
+    }
+  }
+}
+
+//*****************************************************************************
+//
+// Function to manage reconnection attempts to the cellular network (NB IoT).
+//
+//*****************************************************************************
+void handleCellularReconnection() {
+  failureCount++;
+  Serial.println("Failed to connect to cellular network (NB IoT)");
+  if (failureCount >= maxFailures) {
+    if ((nbAccess.begin(PINNUMBER) == NB_READY) && (gprs.attachGPRS() == GPRS_READY)) {
+      Serial.println("Reconnected to cellular network (NB IoT)");
+      resetFailureCounters();
+    } else {
+      Serial.println("Reconnection attempt failed");
+      maxFailures *= BACKOFF_FACTOR; // Increase the number of failures before next reconnection attempt
+      if (maxFailures > MAX_FAILURES) {
+        maxFailures = MAX_FAILURES; // Cap it to a maximum value
+      }
+    }
+  }
+}
+
+//*****************************************************************************
+//
 // Thread to handle sensor data collection and distribution.
 //
 //*****************************************************************************
 static void vTaskSensor(void *pvParameters) {
   TaskStatus_t xTaskDetails; // structure to hold the task's details
 
-  while(1) {
+  while (1) {
     WindData data;
     Heartbeat sensorHeartbeat;
     // Read wind speed register and wind direction register
@@ -197,13 +268,8 @@ static void vTaskSensor(void *pvParameters) {
 //*****************************************************************************
 static void vTaskDataHandler(void *pvParameters) {
   TaskStatus_t xTaskDetails; // structure to hold the task's details
-  const int BASE_FAILURES = 10;  // Base value for failed attempts
-  const int MAX_FAILURES = 800;  // Maximum number of failed attempts before reconnecting
-  static int failureCount = 0; // Counter for consecutive connection errors
-  int maxFailures = BASE_FAILURES; // maximum number of connection errors
-  const int BACKOFF_FACTOR = 2;
 
-  while(1) {
+  while (1) {
     // Current time
     byte hours = rtc.getHours();
     byte minutes = rtc.getMinutes();
@@ -240,7 +306,7 @@ static void vTaskDataHandler(void *pvParameters) {
         Serial.println("******************************");
 
         // Check if the connection to the cellular network (NB IoT) is ready
-        if (nbAccess.status() == NB_READY && gprs.status() == GPRS_READY) {
+        if (isConnectedToCellular()) {
           // Check if the MQTT client is successfully connected to the broker
           if (mqttClient.connected()) {
             // Publish wind data via MQTT
@@ -251,55 +317,21 @@ static void vTaskDataHandler(void *pvParameters) {
             // Read and send data from SD Card
             readAndSendDataFromSDCard();
 
-            failureCount = 0; // Reset the failed attempt counter since there is a successful connection
-            maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
+            // Reset the failed attempt counter
+            resetFailureCounters();
           } else {
-            failureCount++;
-
-            // Connection with MQTT broker failed, handle the error
-            Serial.println("Failed to connect to MQTT broker");
-
             // Save wind data to SD card
             saveDataToSDCard(dataString);
 
-            if (failureCount >= maxFailures) {
-              // Attempt to reconnect to the broker
-              if (mqttClient.connect(broker, port)) {
-                Serial.println("Reconnected to MQTT broker");
-                failureCount = 0; // Reset the failed attempt counter
-                maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
-              } else {
-                Serial.println("Reconnection attempt failed");
-                maxFailures *= BACKOFF_FACTOR;  // Increase the number of failures before next reconnection attempt
-                if (maxFailures > MAX_FAILURES) {
-                  maxFailures = MAX_FAILURES;  // Cap it to a maximum value
-                }
-              }
-            }
+            // Connection with MQTT broker failed, handle the error
+            handleMQTTReconnection();
           }
         } else {
-          failureCount++;
-
-          // Connection with cellular network failed, handle the error
-          Serial.println("Failed to connect to cellular network (NB IoT)");
-
           // Save wind data to SD card
           saveDataToSDCard(dataString);
 
-          if (failureCount >= maxFailures) {
-            // Attempt to reconnect to the cellular network
-            if ((nbAccess.begin(PINNUMBER) == NB_READY) && (gprs.attachGPRS() == GPRS_READY)) {
-              Serial.println("Reconnected to cellular network");
-              failureCount = 0; // Reset the failed attempt counter
-              maxFailures = BASE_FAILURES;  // Reset maxFailures to the base value
-            } else {
-              Serial.println("Reconnection attempt failed");
-              maxFailures *= BACKOFF_FACTOR;  // Increase the number of failures before next reconnection attempt
-              if (maxFailures > MAX_FAILURES) {
-                maxFailures = MAX_FAILURES;  // Cap it to a maximum value
-              }
-            }
-          }
+          // Connection with cellular network failed, handle the error
+          handleCellularReconnection();
         }
       } else {
          Serial.println(ModbusRTUClient.lastError());
@@ -488,11 +520,10 @@ void setup() {
 
   // Should never get here
   while (1) {
-	  Serial.println("Scheduler Failed!");
-	  delay(1000);
+    // If execution reaches here, then there might be insufficient heap memory for creating the idle task
+    Serial.println("Scheduler Failed!");
+    delay(1000);
   }
 }
 
-void loop() {
-  // If execution reaches here, then there might be insufficient heap memory for creating the idle task
-}
+void loop() {}
