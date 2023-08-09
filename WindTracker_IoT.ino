@@ -306,41 +306,45 @@ static void vTaskDataHandler(void *pvParameters) {
         Serial.println("******************************");
 
         // Check if the connection to the cellular network (NB IoT) is ready
-        if (isConnectedToCellular()) {
-          // Check if the MQTT client is successfully connected to the broker
-          if (mqttClient.connected()) {
-            // Publish wind data via MQTT
-            mqttClient.beginMessage(topic_windData, false, QoS, false);
-            mqttClient.print(dataString);
-            mqttClient.endMessage();
-
-            // Read and send data from SD Card
-            readAndSendDataFromSDCard();
-
-            // Reset the failed attempt counter
-            resetFailureCounters();
-          } else {
-            // Save wind data to SD card
-            saveDataToSDCard(dataString);
-
-            // Connection with MQTT broker failed, handle the error
-            handleMQTTReconnection();
-          }
-        } else {
+        if (!isConnectedToCellular()) {
+          // The connection to the cellular network is not ready
           // Save wind data to SD card
           saveDataToSDCard(dataString);
 
           // Connection with cellular network failed, handle the error
           handleCellularReconnection();
+
+          // Check if the MQTT client is successfully connected to the broker
+        } else if (!mqttClient.connected()) {
+          // The MQTT client is not connected to the broker
+          // Save wind data to SD card
+          saveDataToSDCard(dataString);
+
+          // Connection with MQTT broker failed, handle the error
+          handleMQTTReconnection();
+
+          // Both connections are successful
+        } else {
+          // Handle the main logic here
+          // Publish wind data via MQTT
+          mqttClient.beginMessage(topic_windData, false, QoS, false);
+          mqttClient.print(dataString);
+          mqttClient.endMessage();
+
+          // Read and send data from SD Card
+          readAndSendDataFromSDCard();
+
+          // Reset the failed attempt counter
+          resetFailureCounters();
         }
       } else {
-         Serial.println(ModbusRTUClient.lastError());
-         if (mqttClient.connected()) {
-           // Publish error message via MQTT
-           mqttClient.beginMessage(topic_errorMessage);
-           mqttClient.print(ModbusRTUClient.lastError());
-           mqttClient.endMessage();
-         }
+        Serial.println(ModbusRTUClient.lastError());
+        if (mqttClient.connected()) {
+          // Publish error message via MQTT
+          mqttClient.beginMessage(topic_errorMessage);
+          mqttClient.print(ModbusRTUClient.lastError());
+          mqttClient.endMessage();
+        }
       }
     } else {
       // handle error...
