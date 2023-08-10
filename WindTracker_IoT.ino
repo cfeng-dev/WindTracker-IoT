@@ -6,7 +6,7 @@
   Once the internet is back, the stored data is then published again via the broker.
   
   The program uses the ArduinoModbus library and ArduinoRS485 library to communicate with the wind sensor,
-  the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, and SD library, NTPClient library and RTCZero library 
+  the MKRNB library and ArduinoMqttClient library to publish the data via MQTT, and SD library and RTCZero library 
   to save the data with timestamp on the SD card, and the wdt_samd21 library to enable and manage the Watchdog Timer functionality.
 
   The implementation has been enhanced with the use of the FreeRTOS_SAMD21 library, enabling multitasking capabilities
@@ -40,7 +40,6 @@
 #include <ArduinoMqttClient.h>
 #include <MKRNB.h>
 #include <SD.h>
-#include <NTPClient.h>
 #include <RTCZero.h>
 #include <FreeRTOS_SAMD21.h>
 #include <wdt_samd21.h>
@@ -71,14 +70,8 @@ const uint8_t QoS = 2;
 const char topic_windData[] = "Sensor_KN/Winddata";
 const char topic_errorMessage[] = "Sensor_KN/Error";
 
-// NTP Server Konfiguration
-long timeOffset = 3600 * 2; // Timezone offset in seconds (here: GMT+2)
-NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", timeOffset);
-
-// timeClient initializes to 14:30:00 if it does not receive an NTP packet 
-uint8_t HOUR = 14; // 24 hour format
-uint8_t MINUTE = 30;
-uint8_t SECOND = 0;
+// Time configuration
+int timezone = 2; // Timezone offset (here: Summertime GMT+2)
 
 // Connection counter configuration
 const int BASE_FAILURES = 10;  // Base value for failed attempts
@@ -270,18 +263,23 @@ static void vTaskDataHandler(void *pvParameters) {
   TaskStatus_t xTaskDetails; // structure to hold the task's details
 
   while (1) {
+    // Current date
+    byte year = rtc.getYear();
+    byte month = rtc.getMonth();
+    byte day = rtc.getDay();
+
     // Current time
     byte hours = rtc.getHours();
     byte minutes = rtc.getMinutes();
     byte seconds = rtc.getSeconds();
 
-    String timestamp = String(hours) + ":" + String(minutes) + ":" + String(seconds);
+    String timestamp = String(year) + "-" + String(month) + "-" + String(day) + ", " + String(hours) + ":" + String(minutes) + ":" + String(seconds);
     WindData data;
     Heartbeat dataHandlerHeartbeat;
     String dataString;
     DynamicJsonDocument doc(128);
 
-    // Create object "Received".
+    // Create object "Received"
     JsonObject received = doc.createNestedObject("Received");
 
     if (xQueueReceive(queueWindDataMqtt, &data, pdMS_TO_TICKS(100)) == pdPASS) {
@@ -452,44 +450,36 @@ void setup() {
     Serial.println(mqttClient.connectError());
     while (1);
   }
-  Serial.println("You're connected to the MQTT broker");
+  Serial.println("You're connected to the MQTT broker.");
 
   // Initialize time
-  timeClient.begin();
-  timeClient.forceUpdate();
   Serial.print("Initializing time... ");
-  if (!timeClient.isTimeSet()) {
-    Serial.print("Failed to receive NTP packet and set time! Retry... "); 
-    delay(3000);
-    timeClient.forceUpdate();
-    if (!timeClient.isTimeSet()) {
-      Serial.print("Failed to receive NTP packet and set time... ");
-      Serial.println("Set time to 14:30:00 (default)");
-    } else {
-      HOUR = timeClient.getHours() + timeOffset;
-      MINUTE = timeClient.getMinutes();
-      SECOND = timeClient.getSeconds();
-      Serial.println("Time initialized.");
-    }
-  } else {
-    HOUR = timeClient.getHours() + timeOffset;
-    MINUTE = timeClient.getMinutes();
-    SECOND = timeClient.getSeconds();
-    Serial.println("Time initialized.");
+  unsigned long epochTime = nbAccess.getTime(); // Get the current epoch time from the cellular module
+  if (!nbAccess.setTime(epochTime, timezone)) {
+    Serial.print("Error setting time");
+    while (1);
   }
-  timeClient.end();
 
   // Initialize RTC
   rtc.begin();
-  rtc.setHours(HOUR);
-  rtc.setMinutes(MINUTE);
-  rtc.setSeconds(SECOND);
+  rtc.setEpoch(epochTime);
+  Serial.println("Time initialized.");
 
-  // Current time
+  // Current date and time
+  byte year = rtc.getYear();
+  byte month = rtc.getMonth();
+  byte day = rtc.getDay();
   byte hours = rtc.getHours();
   byte minutes = rtc.getMinutes();
   byte seconds = rtc.getSeconds();
+
   Serial.print("Current time -> ");
+  Serial.print(year);
+  Serial.print("-");
+  Serial.print(month);
+  Serial.print("-");
+  Serial.print(day);
+  Serial.print(", ");
   Serial.print(hours);
   Serial.print(":");
   Serial.print(minutes);
@@ -499,7 +489,7 @@ void setup() {
   // Initialize watchdog with 16 seconds (timeout)
   Serial.print("Initializing Watchdog timer (WDT)... ");
   wdt_init (WDT_CONFIG_PER_16K);
-  Serial.println("Watchdog enabled for 16 seconds");
+  Serial.println("Watchdog enabled for 16 seconds.");
 
   // Create the queues
   queueWindDataMqtt = xQueueCreate(10, sizeof(WindData));
