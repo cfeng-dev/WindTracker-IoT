@@ -58,7 +58,6 @@ GPRS gprs;
 NB nbAccess;
 MqttClient mqttClient(client);
 RTCZero rtc;
-NBUDP ntpUDP;
 
 // If your SIM card has a PIN number, please enter it in the "SIM_Card_Secrets.h"
 const char PINNUMBER[] = SECRET_PINNUMBER;
@@ -70,8 +69,9 @@ const uint8_t QoS = 2;
 const char topic_windData[] = "Sensor_KN/Winddata";
 const char topic_errorMessage[] = "Sensor_KN/Error";
 
-// Time configuration
-int timezone = 2; // Timezone offset (here: Summertime GMT+2)
+// Timestamp configuration
+long timeOffset = 3600 * 2; // Timezone offset in seconds (here: Summertime GMT+2)
+unsigned long epochTime_default = 1688904000; // 2023-07-09, 12:00:00
 
 // Connection counter configuration
 const int BASE_FAILURES = 10;  // Base value for failed attempts
@@ -412,11 +412,7 @@ static void vTaskWatchdog(void *pvParameters) {
 void setup() {
   Serial.begin(9600);
   while(!Serial){
-    // Baud rate of the Modbus device (9600 bps), 8 Data bits, No Parity, 1 Stop
-    if (!ModbusRTUClient.begin(9600, SERIAL_8N1)) {
-      Serial.println("Failed to start Modbus RTU Client!");
-      while (1);
-    }
+    // Wait for serial port to connect. Needed for native USB port only
   }
   for(int i = 0; i < 30; i++) {
   Serial.println();
@@ -439,9 +435,17 @@ void setup() {
   if (!SD.begin()) {
     Serial.println("SD card failed, or not present");
     while (1);
-  } else {
-    Serial.println("SD card initialized.");
   }
+  Serial.println("SD card initialized.");
+
+  // Initialize Modbus RTU Client
+  Serial.print("Initializing Modbus RTU Client... ");
+  if (!ModbusRTUClient.begin(9600, SERIAL_8N1)) {
+    // Baud rate of the Modbus device (9600 bps), 8 Data bits, No Parity, 1 Stop
+    Serial.println("Failed to start Modbus RTU Client!");
+    while (1);
+  }
+  Serial.println("Modbus RTU Client initialized.");
 
   // Connect to MQTT
   Serial.print("Connecting to MQTT broker... ");
@@ -455,9 +459,19 @@ void setup() {
   // Initialize time
   Serial.print("Initializing time... ");
   unsigned long epochTime = nbAccess.getTime(); // Get the current epoch time from the cellular module
-  if (!nbAccess.setTime(epochTime, timezone)) {
-    Serial.print("Error setting time");
-    while (1);
+  if (epochTime = 0) {
+    Serial.print("Error getting epoch time! Retry... ");
+    delay(3000);
+    epochTime = nbAccess.getTime(); // Get the current epoch time from the cellular module again
+    if (epochTime = 0) {
+      Serial.print("Error getting epoch time... ");
+      Serial.print("Set timestamp to 2023-07-09, 12:00:00 (default)... ");
+      epochTime = epochTime_default;
+    } else {
+      epochTime += timeOffset;
+    }
+  } else {
+    epochTime += timeOffset;
   }
 
   // Initialize RTC
@@ -488,7 +502,7 @@ void setup() {
 
   // Initialize watchdog with 16 seconds (timeout)
   Serial.print("Initializing Watchdog timer (WDT)... ");
-  wdt_init (WDT_CONFIG_PER_16K);
+  wdt_init(WDT_CONFIG_PER_16K);
   Serial.println("Watchdog enabled for 16 seconds.");
 
   // Create the queues
