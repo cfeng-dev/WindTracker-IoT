@@ -71,7 +71,6 @@ const char topic_errorMessage[] = "Sensor_KN/Error";
 
 // Timestamp configuration
 long timeOffset = 3600 * 2; // Timezone offset in seconds (here: Summertime GMT+2)
-unsigned long epochTime_default = 1688904000; // 2023-07-09, 12:00:00
 
 // Connection counter configuration
 const int BASE_FAILURES = 10;  // Base value for failed attempts
@@ -163,7 +162,7 @@ void resetFailureCounters() {
 //*****************************************************************************
 bool isConnectedToCellular() {
   // Returns true if connected, false otherwise.
-  return (nbAccess.status() == NB_READY && gprs.status() == GPRS_READY);
+  return (nbAccess.status() == NB_READY);
 }
 
 //*****************************************************************************
@@ -197,7 +196,7 @@ void handleCellularReconnection() {
   failureCount++;
   Serial.println("Failed to connect to cellular network (NB IoT)");
   if (failureCount >= maxFailures) {
-    if ((nbAccess.begin(PINNUMBER) == NB_READY) && (gprs.attachGPRS() == GPRS_READY)) {
+    if (nbAccess.begin(PINNUMBER) == NB_READY) {
       Serial.println("Reconnected to cellular network (NB IoT)");
       resetFailureCounters();
     } else {
@@ -246,7 +245,7 @@ static void vTaskSensor(void *pvParameters) {
     Serial.print("vTaskSensor free stack space: ");
     Serial.println(xTaskDetails.usStackHighWaterMark);
 
-    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+    vTaskDelay(pdMS_TO_TICKS(3000));  // delay for 3000 ms
   }
 }
 
@@ -361,7 +360,7 @@ static void vTaskDataHandler(void *pvParameters) {
     Serial.print("vTaskDataHandler free stack space: ");
     Serial.println(xTaskDetails.usStackHighWaterMark);
 
-    vTaskDelay(pdMS_TO_TICKS(4500));  // delay for 4500 ms
+    vTaskDelay(pdMS_TO_TICKS(3000));  // delay for 3000 ms
   }  
 }
 
@@ -405,7 +404,7 @@ static void vTaskWatchdog(void *pvParameters) {
     Serial.print("vTaskWatchdog free stack space: ");
     Serial.println(xTaskDetails.usStackHighWaterMark);
 
-    vTaskDelay(pdMS_TO_TICKS(4500)); // delay for 4500 ms
+    vTaskDelay(pdMS_TO_TICKS(3000)); // delay for 3000 ms
   }
 }
 
@@ -456,27 +455,10 @@ void setup() {
   }
   Serial.println("You're connected to the MQTT broker.");
 
-  // Initialize time
-  Serial.print("Initializing time... ");
-  unsigned long epochTime = nbAccess.getTime(); // Get the current epoch time from the cellular module
-  if (epochTime = 0) {
-    Serial.print("Error getting epoch time! Retry... ");
-    delay(3000);
-    epochTime = nbAccess.getTime(); // Get the current epoch time from the cellular module again
-    if (epochTime = 0) {
-      Serial.print("Error getting epoch time... ");
-      Serial.print("Set timestamp to 2023-07-09, 12:00:00 (default)... ");
-      epochTime = epochTime_default;
-    } else {
-      epochTime += timeOffset;
-    }
-  } else {
-    epochTime += timeOffset;
-  }
-
   // Initialize RTC
+  Serial.print("Initializing time... ");
   rtc.begin();
-  rtc.setEpoch(epochTime);
+  rtc.setEpoch(nbAccess.getLocalTime() + timeOffset); // Get current epoch time from the cellular module
   Serial.println("Time initialized.");
 
   // Current date and time
