@@ -30,22 +30,30 @@ WindTracker_IoT is an intelligent, real-time, and internet-enabled project desig
 - Y connected with A (Green) of the Modbus RTU sensor
 - Z connected with B (White) of the Modbus RTU sensor
 - Jumper positions:
-  - A \/\/ B set to OFF
+  - A W B set to OFF
   - FULL set to OFF
-  - Z \/\/ Y set to ON
+  - Z W Y set to ON
 
 ## Software Requirements
 
-- Arduino IDE
-- Arduino Libraries: ArduinoModbus, ArduinoRS485, ArduinoMqttClient, MKRNB, SD, RTCZero, FreeRTOS_SAMD21, and wdt_samd21
+- Arduino IDE (version 2.1.1)
+- Arduino Libraries:
+  - ArduinoModbus (version 1.0.8)
+  - ArduinoRS485 (version 1.0.5)
+  - ArduinoMqttClient (version 0.1.7)
+  - MKRNB (version 1.5.1)
+  - SD (version 1.2.4)
+  - RTCZero (version 1.6.0)
+  - FreeRTOS_SAMD21 (version 2.3.0)
+  - wdt_samd21 (version 1.1.0)
 
 ## MQTT Broker Configuration
 
-- Broker: "test.mosquitto.org"
+- Broker: test.mosquitto.org
 - Port: 1883
 - Topics: 
-  - "Sensor_KN/Winddata" for wind data
-  - "Sensor_KN/Error" for error messages
+  - `Sensor_KN/Winddata` for wind data
+  - `Sensor_KN/Error` for error messages
 
 ## Author
 
