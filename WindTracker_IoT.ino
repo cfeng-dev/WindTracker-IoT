@@ -336,7 +336,19 @@ static void vTaskDataHandler(void *pvParameters) {
         }
       } else {
         Serial.println(ModbusRTUClient.lastError());
-        if (mqttClient.connected()) {
+
+        // Check if the connection to the cellular network (NB IoT) is ready
+        if (!isConnectedToCellular()) {
+          // Connection with cellular network failed, handle the error
+          handleCellularReconnection();
+
+          // Check if the MQTT client is successfully connected to the broker
+        } else if (!mqttClient.connected()) {
+          // Connection with MQTT broker failed, handle the error
+          handleMQTTReconnection();
+
+          // Both connections are successful
+        } else {
           // Publish error message via MQTT
           mqttClient.beginMessage(topic_errorMessage);
           mqttClient.print(ModbusRTUClient.lastError());
