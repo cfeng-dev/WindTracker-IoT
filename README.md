@@ -1,6 +1,6 @@
 # WindTracker_IoT
 
-WindTracker_IoT is an intelligent, real-time, and internet-enabled project designed for monitoring wind conditions. Using an Ecowitt WS90 wind sensor, it collects data on wind speed and direction. This data is acquired via Modbus RTU 485 communication and then transmitted to a broker via MQTT. A notable feature of the WindTracker_IoT project is its ability to store data offline. When there is no internet connection, the system stores the collected data along with a timestamp on an SD card. Once the internet connection is restored, the system retrieves the stored data and republishes it via the broker. This design ensures no data is lost and provides reliable monitoring of wind conditions regardless of internet availability.
+WindTracker_IoT is an intelligent, real-time, and internet-enabled project designed for monitoring wind conditions. Using an [Ecowitt WS90](https://www.ecowitt.com/shop/goodsDetail/287) wind sensor, it collects data on wind speed and direction. This data is acquired via Modbus RTU 485 communication and then transmitted to a broker via MQTT. A notable feature of the WindTracker_IoT project is its ability to store data offline. When there is no internet connection, the system stores the collected data along with a timestamp on an SD card. Once the internet connection is restored, the system retrieves the stored data and republishes it via the broker. This design ensures no data is lost and provides reliable monitoring of wind conditions regardless of internet availability.
 
 ## Functionality
 
